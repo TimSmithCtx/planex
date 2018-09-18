@@ -8,6 +8,9 @@ import subprocess
 import os
 import re
 import shutil
+# Important note: shutil's copytree does not do what
+# we need, as the destination dir already exists
+from distutils.dir_util import copy_tree  # pylint: disable=F0401,E0611
 import tarfile
 import tempfile
 
@@ -36,6 +39,8 @@ def parse_args_or_exit(argv=None):
                         help="Add inline comments in the spec file "
                         "to specify what provided sources, patches "
                         "and patchqueues")
+    parser.add_argument("--destdir", dest="destdir", nargs=1,
+                        help="Directory containing SRPMS dir for output")
     argcomplete.autocomplete(parser)
 
     parsed_args = parser.parse_args(argv)
@@ -59,7 +64,7 @@ def rpmbuild(args, tmpdir, specfile):
         cmd.append('--define')
         cmd.append(" ".join(define))
     cmd.append('--define')
-    cmd.append('_sourcedir %s' % tmpdir)
+    cmd.append('_topdir %s' % tmpdir)
     cmd.append('-bs')
     cmd.append(specfile)
 
@@ -119,9 +124,11 @@ def populate_working_directory(metadata, tmpdir, spec):
     Build a working directory containing everything needed to build the SRPM.
     """
 
+    specdst = os.path.join(tmpdir, "SPECS")
+    sourcedst = os.path.join(tmpdir, "SOURCES")
     sources = [os.path.basename(source[0]) for source in spec.sources()]
     try:
-        skipped = spec.extract_sources(sources, tmpdir)
+        skipped = spec.extract_sources(sources, sourcedst)
     except KeyError as err:
         print("Could not find a source for {}".format(err))
         skipped = set()
@@ -129,7 +136,7 @@ def populate_working_directory(metadata, tmpdir, spec):
     if skipped:
         print("The following archives have been ignored: {}".format(skipped))
 
-    newspec = os.path.join(tmpdir, os.path.basename(spec.specpath()))
+    newspec = os.path.join(specdst, os.path.basename(spec.specpath()))
     manifests = {
         url: sha
         for url, sha in [
@@ -158,11 +165,18 @@ def main(argv=None):
 
     args = parse_args_or_exit(argv)
     tmpdir = tempfile.mkdtemp(prefix="px-srpm-")
+    for subdir in ['BUILD', 'BUILDROOT', 'RPMS', 'SOURCES', 'SPECS', 'SRPMS']:
+        os.mkdir(os.path.join(tmpdir, subdir))
 
     try:
-        spec = load(args.spec, args.link, defines=args.define)
+        spec = load(args.spec, args.link, defines=[('_topdir', args.destdir[0]),
+                                                   ('_sourcedir', '%_topdir/SOURCES/%name')])
         specfile = populate_working_directory(args.metadata, tmpdir, spec)
-        sys.exit(rpmbuild(args, tmpdir, specfile))
+        buildret = rpmbuild(args, tmpdir, specfile)
+        if buildret == 0:
+            copy_tree(os.path.join(tmpdir, "SRPMS"), os.path.join(args.destdir[0], "SRPMS"))
+
+        sys.exit(buildret)
 
     except (tarfile.TarError, tarfile.ReadError) as exc:
         print("Error when extracting patchqueue from tarfile")
